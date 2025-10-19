@@ -1,0 +1,241 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Raspberry Pi Monitor</title>
+<style>
+  :root{--fg:#111;--muted:#6b7280;--line:#e5e7eb;--bg:#fafafa}
+  *{box-sizing:border-box}
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;color:var(--fg);background:var(--bg)}
+  h1{margin:0 0 1rem}
+  h3{margin:.75rem 0 .5rem}
+  .card{background:#fff;border:1px solid var(--line);border-radius:16px;padding:16px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+  .row{display:flex;justify-content:space-between;align-items:baseline;margin:.25rem 0;color:#374151}
+  .label{color:var(--muted)}
+  .bar{height:8px;background:var(--line);border-radius:999px;overflow:hidden}
+  .fill{height:100%;width:0%;transition:width .25s linear;background:var(--fg)}
+  .mono{font-variant-numeric:tabular-nums}
+  .pill{display:inline-block;padding:.1rem .5rem;border:1px solid var(--line);border-radius:999px;color:#374151;font-size:.8rem}
+  .disk{padding:12px;margin:8px 0;border:1px solid var(--line);border-radius:12px}
+  .status{font-weight:600}
+  .status.ok{color:#065f46}
+  .status.watch{color:#92400e}
+  .status.fail{color:#991b1b}
+  .status.power{color:#1f2937}
+  .status.bad{color:#b91c1c}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:.25rem .5rem;margin-top:.25rem}
+  .kv .k{color:var(--muted)}
+  .kv .v{text-align:right}
+</style>
+
+<h1>Raspberry Pi</h1>
+
+<div class="card">
+  <h3>System</h3>
+  <div class="row"><span class="label">Hostname</span><span id="host" class="mono"></span></div>
+  <div class="row"><span class="label">Platform</span><span><span id="plat" class="mono"></span> <span id="arch" class="pill"></span></span></div>
+  <div class="row"><span class="label">CPU Temp</span><span id="temp" class="mono"></span></div>
+
+  <h3 style="margin-top:1rem">Pi Power (VC Throttle)</h3>
+  <div id="power"></div>
+
+  <h3 style="margin-top:1rem">CPU Usage</h3>
+  <div id="cpus"></div>
+
+  <h3 style="margin-top:1rem">Memory</h3>
+  <div class="row"><span class="label">Used</span><span id="mem" class="mono"></span></div>
+  <div class="bar"><div id="memFill" class="fill"></div></div>
+
+  <h3 style="margin-top:1rem">Disks</h3>
+  <div id="disks"></div>
+
+  <h3 style="margin-top:1rem">USB Link (declared, not live current)</h3>
+  <div id="usb"></div>
+
+  <h3 style="margin-top:1rem">Disk Health (SMART)</h3>
+  <div id="smart"></div>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  function setWidthSmooth(el, pct){
+    if (!el) return;
+    const w = pct + '%';
+    if (el.style.width === w) return;
+    void el.offsetWidth; el.style.width = w;
+  }
+
+  function barRow(i){
+    const wrap=document.createElement('div'); wrap.style.margin='6px 0';
+    const top=document.createElement('div'); top.className='row';
+    const l=document.createElement('span'); l.textContent='Core '+i; l.className='label';
+    const r=document.createElement('span'); r.className='mono'; r.id='cval'+i;
+    top.append(l,r);
+    const bar=document.createElement('div'); bar.className='bar';
+    const fill=document.createElement('div'); fill.className='fill'; fill.id='cbar'+i;
+    bar.append(fill); wrap.append(top,bar); return wrap;
+  }
+
+  function diskRow(id, d){
+    const wrap=document.createElement('div'); wrap.className='disk';
+    const top=document.createElement('div'); top.className='row';
+    const left=document.createElement('div');
+    left.innerHTML = `<span class="label">${d.mount}</span> <span class="pill">${d.kind}</span> <span class="pill">${d.fstype}</span>`;
+    const right=document.createElement('span'); right.className='mono'; right.id=id+'-val';
+    top.append(left,right);
+    const sub=document.createElement('div'); sub.className='row';
+    const dev=document.createElement('span'); dev.textContent=d.device; dev.className='mono';
+    const bar=document.createElement('div'); bar.className='bar'; bar.style.width='55%';
+    const fill=document.createElement('div'); fill.className='fill'; fill.id=id+'-bar';
+    bar.append(fill); sub.append(dev, bar); wrap.append(top, sub); return wrap;
+  }
+
+  function smartBlock(d){
+    const s = d.smart || {available:false};
+    const wrap=document.createElement('div'); wrap.className='disk';
+
+    const title=document.createElement('div'); title.className='row';
+    const left=document.createElement('div');
+    left.innerHTML = `<strong>${d.baseDevice}</strong> <span class="pill">${d.kind}</span>`;
+    const right=document.createElement('div');
+    let statusText='—', statusClass='';
+    if (s.available){
+      if (s.status === 'OK') statusText='OK', statusClass='ok';
+      else if (s.status === 'Watch') statusText='Watch', statusClass='watch';
+      else if (s.status === 'Fail') statusText='Fail', statusClass='fail';
+      else if (s.status === 'Check power/cable') statusText='Check power/cable', statusClass='power';
+    } else statusText = 'No SMART';
+    right.innerHTML = `<span class="status ${statusClass}">${statusText}</span>`;
+    title.append(left,right);
+
+    const kv=document.createElement('div'); kv.className='kv';
+    const row=(k,v)=>{const K=document.createElement('div');K.className='k';K.textContent=k;
+                      const V=document.createElement('div');V.className='v mono';V.textContent=(v ?? '—'); kv.append(K,V);};
+
+    if (s.available){
+      row('Model', s.model ?? '—'); row('Serial', s.serial ?? '—');
+      row('Health', s.health_passed===true ? 'PASSED' : (s.health_passed===false ? 'FAILING' : '—'));
+      row('Temp (°C)', s.temperature); row('Power-On Hours', s.power_on_hours);
+      row('Reallocated', s.reallocated); row('Pending', s.pending); row('Uncorrectable', s.uncorrectable);
+      row('UDMA CRC Errors', s.crc_errors); row('Start/Stop', s.start_stop); row('Power Cycles', s.power_cycles);
+      if (s.power_hint){ const note=document.createElement('div'); note.className='label'; note.textContent=s.power_hint; kv.append(document.createElement('div'), note); }
+      if (s.note){ const note=document.createElement('div'); note.className='label'; note.textContent=s.note; kv.append(document.createElement('div'), note); }
+    } else { row('Note', (s.note || 'SMART not available')); }
+
+    wrap.append(title, kv); return wrap;
+  }
+
+  function powerBlock(t){
+    const wrap=document.createElement('div'); wrap.className='disk';
+    const title=document.createElement('div'); title.className='row';
+    const left=document.createElement('div'); left.innerHTML = `<strong>Pi Power Status</strong>`;
+    const right=document.createElement('div');
+    let cls='ok'; if (t && t.available){
+      if (t.under_voltage_now || t.throttled_now) cls='bad';
+      else if (t.freq_capped_now || t.under_voltage_hist || t.throttled_hist) cls='watch';
+    }
+    const label=(t && t.available) ? t.status : 'Unknown';
+    right.innerHTML = `<span class="status ${cls}">${label}</span>`;
+    title.append(left,right);
+
+    const kv=document.createElement('div'); kv.className='kv';
+    const row=(k,v)=>{const K=document.createElement('div');K.className='k';K.textContent=k;
+                      const V=document.createElement('div');V.className='v mono';V.textContent=(v ?? '—'); kv.append(K,V);};
+    if (!t || !t.available) row('Note', t && t.note ? t.note : 'vcgencmd not available');
+    else {
+      row('Raw', t.raw);
+      row('Under-voltage (now)', t.under_voltage_now ? 'YES' : 'no');
+      row('Throttled (now)', t.throttled_now ? 'YES' : 'no');
+      row('Freq capped (now)', t.freq_capped_now ? 'YES' : 'no');
+      row('Under-voltage (history)', t.under_voltage_hist ? 'YES' : 'no');
+      row('Throttled (history)', t.throttled_hist ? 'YES' : 'no');
+      row('Freq capped (history)', t.freq_capped_hist ? 'YES' : 'no');
+      if (t.note) row('Note', t.note);
+    }
+    wrap.append(title, kv); return wrap;
+  }
+
+  function usbBlock(d){
+    const u = d.usb || {available:false};
+    const wrap=document.createElement('div'); wrap.className='disk';
+
+    const title=document.createElement('div'); title.className='row';
+    const left=document.createElement('div');
+    left.innerHTML = `<strong>${d.baseDevice} — USB Link</strong>`;
+    const right=document.createElement('div');
+    const label = (u.available ? (u.driver || 'usb') : 'Unknown');
+    right.innerHTML = `<span class="status">${label}</span>`;
+    title.append(left,right);
+
+    const kv=document.createElement('div'); kv.className='kv';
+    const row=(k,v)=>{const K=document.createElement('div');K.className='k';K.textContent=k;
+                      const V=document.createElement('div');V.className='v mono';V.textContent=(v ?? '—'); kv.append(K,V);};
+
+    if (!u.available){
+      row('Note', u.note || 'USB sysfs info not available');
+    } else {
+      row('Product', (u.manufacturer && u.product) ? `${u.manufacturer} ${u.product}` : (u.product || '—'));
+      row('VID:PID', (u.vid && u.pid) ? `${u.vid}:${u.pid}` : '—');
+      row('Driver', u.driver || '—');  // 'uas' or 'usb-storage'
+      row('Speed (Mb/s)', u.speed_Mbps ?? '—'); // 480 for HS, 5000 for SS
+      row('Declared MaxPower', (u.declaredMaxPower_mA != null) ? `${u.declaredMaxPower_mA} mA` : '—');
+      row('Note', u.note || 'Declared MaxPower is descriptor value, not live current');
+    }
+
+    wrap.append(title, kv); return wrap;
+  }
+
+  async function refresh(){
+    try{
+      const res = await fetch('/metrics',{cache:'no-store'});
+      const m = await res.json();
+
+      $('host').textContent = m.hostname;
+      $('plat').textContent = m.platform;
+      $('arch').textContent = m.arch;
+      $('temp').textContent = (m.cpuTemp!=null ? m.cpuTemp.toFixed(1)+'°C' : '—');
+
+      // power/undervolt
+      const pWrap = $('power'); pWrap.innerHTML = ''; pWrap.append(powerBlock(m.power?.throttle || null));
+
+      // CPU
+      const c = $('cpus');
+      if (c.childElementCount !== m.cpuUsage.length){ c.innerHTML = ''; for (let i=0;i<m.cpuUsage.length;i++) c.append(barRow(i)); }
+      m.cpuUsage.forEach((v,i)=>{ $('cval'+i).textContent = v.toFixed(1)+'%'; setWidthSmooth($('cbar'+i), v); });
+
+      // Memory
+      const used = m.memoryUsage.used, total = m.memoryUsage.total;
+      $('mem').textContent = used.toFixed(2)+' / '+total.toFixed(2)+' GB';
+      setWidthSmooth($('memFill'), (used/total*100));
+
+      // Disks (usage)
+      const dWrap = $('disks');
+      if (!dWrap.dataset.count || parseInt(dWrap.dataset.count)!==m.disks.length){
+        dWrap.innerHTML=''; m.disks.forEach((d,idx)=>{ dWrap.append(diskRow('disk'+idx, d)); });
+        dWrap.dataset.count = String(m.disks.length);
+      }
+      m.disks.forEach((d,idx)=>{
+        const id = 'disk'+idx;
+        const text = `${d.used.toFixed(2)} / ${d.total.toFixed(2)} GB (${d.percent.toFixed(1)}%)`;
+        const pct = Math.max(0, Math.min(100, d.percent));
+        const v = document.getElementById(id+'-val'); const b = document.getElementById(id+'-bar');
+        if (v) v.textContent = text; setWidthSmooth(b, pct);
+      });
+
+      // USB link panel (for USB disks only, unique base device)
+      const uWrap = $('usb'); uWrap.innerHTML = '';
+      const seen = new Set();
+      m.disks.forEach((d)=>{ if (d.kind==='usb' && !seen.has(d.baseDevice)){ uWrap.append(usbBlock(d)); seen.add(d.baseDevice); }});
+      if (uWrap.children.length === 0){ const none=document.createElement('div'); none.className='label'; none.textContent='No USB disks detected.'; uWrap.append(none); }
+
+      // SMART (USB disks unique)
+      const sWrap = $('smart'); sWrap.innerHTML = '';
+      const seen2 = new Set();
+      m.disks.forEach((d)=>{ if (d.kind==='usb' && !seen2.has(d.baseDevice)){ sWrap.append(smartBlock(d)); seen2.add(d.baseDevice); }});
+      if (sWrap.children.length === 0){ const none=document.createElement('div'); none.className='label'; none.textContent='No USB disks with SMART, or SMART not available.'; sWrap.append(none); }
+
+    }catch(e){ console.error(e); }
+  }
+
+  refresh(); setInterval(refresh, 1500);
+</script>
